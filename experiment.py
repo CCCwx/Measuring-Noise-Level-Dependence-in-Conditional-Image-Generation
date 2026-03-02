@@ -2,10 +2,13 @@
 Measuring Noise-Level Dependence in Conditional Image Generation
 Main experiment script: custom DDIM sampling with CIS, TS, and SAS metrics.
 Uses Stable Diffusion 1.5 via HuggingFace diffusers.
+Supports text conditioning and ControlNet-style structural conditioning.
 """
 
 import os
+import sys
 import json
+import argparse
 import torch
 import numpy as np
 import matplotlib
@@ -15,12 +18,34 @@ from PIL import Image
 from diffusers import StableDiffusionPipeline, DDIMScheduler
 import open_clip
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16
-OUTPUT_DIR = "/mnt/root/charles/ECE285_project/results"
-FIGURE_DIR = "/mnt/root/charles/ECE285_project/report/figures"
+# Optional: ControlNet (requires diffusers with ControlNet support)
+try:
+    from diffusers import StableDiffusionControlNetPipeline, ControlNetModel
+    HAS_CONTROLNET = True
+except ImportError:
+    HAS_CONTROLNET = False
+
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
+# Project-relative paths (override with env vars)
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.environ.get("ECE285_OUTPUT_DIR", os.path.join(_PROJECT_ROOT, "results"))
+FIGURE_DIR = os.environ.get("ECE285_FIGURE_DIR", os.path.join(_PROJECT_ROOT, "report", "figures"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(FIGURE_DIR, exist_ok=True)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.float16
+
+# SD 1.5 base model: default uses Hugging Face cache (runwayml/stable-diffusion-v1-5).
+# Override with env SD15_MODEL_ID if you use a local path, e.g. "stable-diffusion-v1-5/stable-diffusion-v1-5"
+SD15_MODEL_ID = os.environ.get("SD15_MODEL_ID", "runwayml/stable-diffusion-v1-5")
+# ControlNet model (Canny edge for SD 1.5); also uses HF cache when already downloaded
+CONTROLNET_MODEL_ID = "lllyasviel/control_v11p_sd15_canny"
 
 SEED = 42
 NUM_INFERENCE_STEPS = 50
@@ -39,6 +64,15 @@ PROMPTS = [
     "A snowy mountain landscape with pine trees",
 ]
 
+PROMPTS_GEOMETRY = [
+    "A photograph of a circle and a rectangle",
+    "An abstract painting of geometric shapes",
+    "A 3D render of a sphere and a cube",
+    "A simple sketch of basic geometry",
+    "Geometric shapes on a white background",
+    "A circle and a box",
+]
+
 PROMPT_PAIRS = [
     ("A red sports car on a mountain road",
      "A blue sports car on a mountain road"),
@@ -52,11 +86,9 @@ PROMPT_PAIRS = [
 
 
 def load_sd_pipeline():
-    scheduler = DDIMScheduler.from_pretrained(
-        "stable-diffusion-v1-5/stable-diffusion-v1-5", subfolder="scheduler"
-    )
+    scheduler = DDIMScheduler.from_pretrained(SD15_MODEL_ID, subfolder="scheduler")
     pipe = StableDiffusionPipeline.from_pretrained(
-        "stable-diffusion-v1-5/stable-diffusion-v1-5",
+        SD15_MODEL_ID,
         scheduler=scheduler,
         torch_dtype=DTYPE,
         safety_checker=None,
@@ -64,6 +96,108 @@ def load_sd_pipeline():
     pipe = pipe.to(DEVICE)
     pipe.set_progress_bar_config(disable=True)
     return pipe
+
+
+def load_controlnet_pipeline():
+    """Load SD 1.5 + ControlNet (Canny). Requires diffusers with ControlNet support."""
+    if not HAS_CONTROLNET:
+        raise RuntimeError("ControlNet requires: pip install diffusers (with ControlNet support)")
+    controlnet = ControlNetModel.from_pretrained(CONTROLNET_MODEL_ID, torch_dtype=DTYPE)
+    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+        SD15_MODEL_ID,
+        controlnet=controlnet,
+        torch_dtype=DTYPE,
+        safety_checker=None,
+    )
+    pipe.scheduler = DDIMScheduler.from_pretrained(SD15_MODEL_ID, subfolder="scheduler")
+    pipe = pipe.to(DEVICE)
+    pipe.set_progress_bar_config(disable=True)
+    return pipe
+
+
+def prepare_control_image(pipe_cn, image, height=IMG_HEIGHT, width=IMG_WIDTH):
+    """Convert PIL/numpy image to ControlNet cond tensor (B=1, RGB, float in [0,1]).
+    IMPORTANT: Do NOT normalize to [-1,1] here; diffusers ControlNet expects [0,1] control maps."""
+    if isinstance(image, Image.Image):
+        image = np.array(image.resize((width, height)))
+    elif not isinstance(image, np.ndarray):
+        image = np.array(image)
+    if image.ndim == 2:
+        image = np.stack([image] * 3, axis=-1)
+    image = image.astype(np.float32) / 255.0
+    image = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(DEVICE, dtype=DTYPE)
+    return image
+
+
+def create_synthetic_control_images(n, size=(IMG_HEIGHT, IMG_WIDTH), seed=SEED):
+    """Create n reproducible Canny-style control images (no external files)."""
+    if not HAS_CV2:
+        raise RuntimeError("Synthetic control images require opencv-python: pip install opencv-python")
+    rng = np.random.default_rng(seed)
+    images = []
+    for i in range(n):
+        # Deterministic geometric pattern + noise then Canny
+        h, w = size[0], size[1]
+        canvas = np.ones((h, w), dtype=np.uint8) * 255
+        # Draw a few shapes (reproducible)
+        cx, cy = w // 2 + (i * 37) % 100 - 50, h // 2 + (i * 53) % 80 - 40
+        cv2.circle(canvas, (cx % w, cy % h), 80 + (i * 7) % 40, 0, 2)
+        cv2.rectangle(canvas, (100 + i * 50, 100), (300 + i * 20, 400), 0, 2)
+        # Add light noise then blur so Canny gives edges
+        noise = (rng.random((h, w)) * 30).astype(np.uint8)
+        canvas = np.clip(canvas.astype(np.int32) - noise, 0, 255).astype(np.uint8)
+        canvas = cv2.GaussianBlur(canvas, (5, 5), 1.0)
+        edges = cv2.Canny(canvas, 50, 150)
+        rgb = np.stack([edges] * 3, axis=-1)
+        images.append(Image.fromarray(rgb))
+    return images
+
+
+def create_prompt_matched_control_images(pipe_cn, prompts, seed=SEED, steps=20):
+    """Create prompt-matched Canny control images without external data.
+    We first generate a reference image for each prompt (with ControlNet scale=0),
+    then extract Canny edges from that reference image as the ControlNet condition.
+
+    This keeps text prompts identical to text-only experiments while providing
+    semantically consistent structural conditions."""
+    if not HAS_CV2:
+        raise RuntimeError("Prompt-matched control images require opencv-python: pip install opencv-python")
+
+    blank = Image.fromarray(np.zeros((IMG_HEIGHT, IMG_WIDTH, 3), dtype=np.uint8), mode="RGB")
+    controls = []
+    for i, prompt in enumerate(prompts):
+        gen = torch.Generator(device=DEVICE).manual_seed(seed + i)
+        # Generate a reference image with structure scale = 0
+        try:
+            out = pipe_cn(
+                prompt=prompt,
+                image=blank,
+                controlnet_conditioning_scale=0.0,
+                num_inference_steps=steps,
+                guidance_scale=GUIDANCE_SCALE,
+                height=IMG_HEIGHT,
+                width=IMG_WIDTH,
+                generator=gen,
+            )
+        except TypeError:
+            out = pipe_cn(
+                prompt=prompt,
+                control_image=blank,
+                controlnet_conditioning_scale=0.0,
+                num_inference_steps=steps,
+                guidance_scale=GUIDANCE_SCALE,
+                height=IMG_HEIGHT,
+                width=IMG_WIDTH,
+                generator=gen,
+            )
+        ref = out.images[0].convert("RGB")
+        ref_np = np.array(ref).astype(np.uint8)
+        ref_gray = cv2.cvtColor(ref_np, cv2.COLOR_RGB2GRAY)
+        ref_gray = cv2.GaussianBlur(ref_gray, (5, 5), 1.0)
+        edges = cv2.Canny(ref_gray, 50, 150)
+        rgb = np.stack([edges] * 3, axis=-1)
+        controls.append(Image.fromarray(rgb, mode="RGB"))
+    return controls
 
 
 def load_clip_model():
@@ -118,16 +252,25 @@ def ddim_step(pipe, latents, t, noise_pred, t_prev):
 
 
 def predicted_x0_to_image(pipe, pred_x0):
-    pred_x0_scaled = pred_x0 / pipe.vae.config.scaling_factor
+    """Decode predicted x0 latent to RGB PIL Image in [0, 255]. Safe for CLIP and Canny."""
+    scaling_factor = getattr(pipe.vae.config, "scaling_factor", 0.18215)
+    pred_x0_scaled = (pred_x0.float() / scaling_factor).to(pipe.vae.dtype)
     with torch.no_grad():
-        image = pipe.vae.decode(pred_x0_scaled.to(DTYPE)).sample
+        image = pipe.vae.decode(pred_x0_scaled).sample
+    # VAE output is in [-1, 1]; normalize to [0, 1] in float32 for precision
+    image = image.cpu().float().clamp(-1, 1)
     image = (image / 2 + 0.5).clamp(0, 1)
-    image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-    image = (image * 255).round().astype(np.uint8)
-    return Image.fromarray(image[0])
+    image = image.permute(0, 2, 3, 1).numpy()
+    # Ensure [0, 255] uint8 RGB for downstream (CLIP, Canny)
+    rgb = np.clip((image * 255.0), 0, 255).round().astype(np.uint8)
+    pil = Image.fromarray(rgb[0], mode="RGB")
+    return pil
 
 
 def compute_clip_similarity(clip_model, clip_preprocess, clip_tokenizer, image, text):
+    """Image must be PIL RGB in [0, 255] for correct CLIP encoding."""
+    if isinstance(image, Image.Image) and image.mode != "RGB":
+        image = image.convert("RGB")
     img_tensor = clip_preprocess(image).unsqueeze(0).to(DEVICE)
     text_tokens = clip_tokenizer([text]).to(DEVICE)
     with torch.no_grad():
@@ -327,6 +470,299 @@ def run_cis_multi_guidance(pipe, prompts, guidance_scales=None, seed=SEED):
     }
 
 
+# =============================================================================
+# ControlNet-style structural conditioning experiments
+# =============================================================================
+
+CONTROLNET_STRUCT_SCALE = 1.0  # default conditioning scale when structure is "on"
+
+
+def _controlnet_noise_pred(pipe_cn, latents, t, prompt_embeds, control_image_tensor, struct_scale):
+    """Single noise prediction: text + structural conditioning at scale struct_scale.
+    prompt_embeds: (B, seq, dim), control_image_tensor: (B, 3, H, W). Returns (B, 4, h, w)."""
+    latent_model_input = pipe_cn.scheduler.scale_model_input(latents, t)
+    with torch.no_grad():
+        try:
+            down_res, mid_res = pipe_cn.controlnet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=prompt_embeds,
+                controlnet_cond=control_image_tensor,
+                return_dict=False,
+            )
+        except TypeError:
+            down_res, mid_res = pipe_cn.controlnet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=prompt_embeds,
+                image=control_image_tensor,
+                return_dict=False,
+            )
+        down_res = [r * struct_scale for r in down_res]
+        mid_res = mid_res * struct_scale
+        noise_pred = pipe_cn.unet(
+            latent_model_input,
+            t,
+            encoder_hidden_states=prompt_embeds,
+            down_block_additional_residuals=down_res,
+            mid_block_additional_residual=mid_res,
+        ).sample
+    return noise_pred
+
+
+def _controlnet_cfg_step(pipe_cn, latents, t, t_prev, text_emb, uncond_emb, control_image_tensor, struct_scale):
+    """One DDIM step with CFG (text) and structural conditioning at struct_scale.
+    Duplicates batch for [uncond, cond] and applies CFG. t_prev = next timestep value, or -1 for last step."""
+    prompt_embeds = torch.cat([uncond_emb, text_emb], dim=0)
+    control_batch = control_image_tensor.repeat(2, 1, 1, 1)
+    latent_input = latents.repeat(2, 1, 1, 1)
+    noise_pred_both = _controlnet_noise_pred(
+        pipe_cn, latent_input, t, prompt_embeds, control_batch, struct_scale
+    )
+    noise_uncond, noise_cond = noise_pred_both.chunk(2, dim=0)
+    noise_pred = noise_uncond + GUIDANCE_SCALE * (noise_cond - noise_uncond)
+    # DDIM step (single batch)
+    alpha_prod_t = pipe_cn.scheduler.alphas_cumprod[t]
+    if t_prev is not None and t_prev >= 0:
+        alpha_prod_t_prev = pipe_cn.scheduler.alphas_cumprod[t_prev]
+    else:
+        alpha_prod_t_prev = getattr(
+            pipe_cn.scheduler, "final_alpha_cumprod",
+            pipe_cn.scheduler.alphas_cumprod[0],
+        )
+    pred_x0 = (latents - (1 - alpha_prod_t).sqrt() * noise_pred) / alpha_prod_t.sqrt()
+    pred_x0 = pred_x0.clamp(-1, 1)
+    dir_xt = (1 - alpha_prod_t_prev).sqrt() * noise_pred
+    prev_latents = alpha_prod_t_prev.sqrt() * pred_x0 + dir_xt
+    return prev_latents, pred_x0
+
+
+def run_cis_struct(pipe_cn, clip_model, clip_preprocess, clip_tokenizer, prompts, control_images, seed=SEED):
+    """CIS for structural conditioning: at each step, magnitude of (noise with struct - noise without struct)."""
+    pipe_cn.scheduler.set_timesteps(NUM_INFERENCE_STEPS, device=DEVICE)
+    timesteps = pipe_cn.scheduler.timesteps
+    n_prompts = min(len(prompts), len(control_images))
+    all_cis = []
+
+    for pi in range(n_prompts):
+        prompt = prompts[pi]
+        ctrl_img = control_images[pi]
+        print(f"  [CIS_struct] Prompt {pi+1}/{n_prompts}: {prompt[:40]}...")
+        text_emb, uncond_emb = encode_prompt(pipe_cn, prompt)
+        ctrl_tensor = prepare_control_image(pipe_cn, ctrl_img)
+
+        generator = torch.Generator(device=DEVICE).manual_seed(seed)
+        latents = torch.randn(
+            (1, pipe_cn.unet.config.in_channels, IMG_HEIGHT // 8, IMG_WIDTH // 8),
+            generator=generator, device=DEVICE, dtype=DTYPE,
+        )
+        latents = latents * pipe_cn.scheduler.init_noise_sigma
+
+        cis_values = []
+        for i, t in enumerate(timesteps):
+            # _controlnet_noise_pred internally applies scheduler.scale_model_input(...)
+            noise_with = _controlnet_noise_pred(pipe_cn, latents, t, text_emb, ctrl_tensor, 1.0)
+            noise_without = _controlnet_noise_pred(pipe_cn, latents, t, text_emb, ctrl_tensor, 0.0)
+            cis = (noise_with - noise_without).float().norm().item()
+            cis_values.append(cis)
+            # Advance latents with full conditioning for next step
+            t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else None
+            latents, _ = _controlnet_cfg_step(
+                pipe_cn, latents, t, timesteps[i + 1] if i + 1 < len(timesteps) else -1,
+                text_emb, uncond_emb, ctrl_tensor, CONTROLNET_STRUCT_SCALE,
+            )
+        all_cis.append(cis_values)
+
+    return {
+        "timesteps": [t.item() for t in timesteps],
+        "cis_struct_per_prompt": all_cis,
+        "prompts": prompts[:n_prompts],
+    }
+
+
+def run_ts_struct(pipe_cn, prompt, control_image_pairs, seed=SEED):
+    """TS for structure: same prompt and noise, two different control images; trajectory L2 divergence."""
+    pipe_cn.scheduler.set_timesteps(NUM_INFERENCE_STEPS, device=DEVICE)
+    timesteps = pipe_cn.scheduler.timesteps
+    text_emb, uncond_emb = encode_prompt(pipe_cn, prompt)
+    all_ts = []
+
+    for pair_idx, (ctrl_a, ctrl_b) in enumerate(control_image_pairs):
+        print(f"  [TS_struct] Pair {pair_idx+1}/{len(control_image_pairs)}")
+        ctrl_a_t = prepare_control_image(pipe_cn, ctrl_a)
+        ctrl_b_t = prepare_control_image(pipe_cn, ctrl_b)
+
+        generator = torch.Generator(device=DEVICE).manual_seed(seed)
+        latents_a = torch.randn(
+            (1, pipe_cn.unet.config.in_channels, IMG_HEIGHT // 8, IMG_WIDTH // 8),
+            generator=generator, device=DEVICE, dtype=DTYPE,
+        )
+        latents_a = latents_a * pipe_cn.scheduler.init_noise_sigma
+        latents_b = latents_a.clone()
+
+        ts_values = []
+        for i, t in enumerate(timesteps):
+            t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else -1
+            latents_a, _ = _controlnet_cfg_step(
+                pipe_cn, latents_a, t, t_prev, text_emb, uncond_emb, ctrl_a_t, CONTROLNET_STRUCT_SCALE,
+            )
+            latents_b, _ = _controlnet_cfg_step(
+                pipe_cn, latents_b, t, t_prev, text_emb, uncond_emb, ctrl_b_t, CONTROLNET_STRUCT_SCALE,
+            )
+            divergence = (latents_a.float() - latents_b.float()).norm().item()
+            ts_values.append(divergence)
+        all_ts.append(ts_values)
+
+    return {
+        "timesteps": [t.item() for t in timesteps],
+        "ts_struct_per_pair": all_ts,
+        "prompt": prompt,
+        "num_pairs": len(control_image_pairs),
+    }
+
+
+def _pil_to_uint8_rgb(pil_img, size=None):
+    """Ensure we have (H, W) or (H, W, 3) uint8 in [0, 255] for Canny. size = (width, height) for resize."""
+    if size is not None:
+        pil_img = pil_img.resize(size)
+    arr = np.array(pil_img)
+    if arr.dtype != np.uint8:
+        if arr.size > 0 and np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.0 and arr.min() >= 0:
+            arr = (np.clip(arr, 0, 1) * 255).round().astype(np.uint8)
+        else:
+            arr = np.clip(arr, 0, 255).round().astype(np.uint8)
+    return arr
+
+
+def _structural_similarity_canny(gen_pil, condition_pil):
+    """Structural alignment: Canny edges of gen vs condition. Returns IoU in [0,1] (higher = more similar).
+    Both inputs must be RGB images in [0, 255] (PIL or already decoded)."""
+    if not HAS_CV2:
+        return 0.0
+    gen = _pil_to_uint8_rgb(gen_pil, size=(IMG_WIDTH, IMG_HEIGHT))
+    cond = _pil_to_uint8_rgb(condition_pil, size=(IMG_WIDTH, IMG_HEIGHT))
+    if gen.ndim == 3:
+        gen = cv2.cvtColor(gen, cv2.COLOR_RGB2GRAY)
+    if cond.ndim == 3:
+        cond = cv2.cvtColor(cond, cv2.COLOR_RGB2GRAY)
+    e_gen = cv2.Canny(cv2.GaussianBlur(gen, (3, 3), 0.5), 50, 150)
+    # If condition is already a binary edge map (e.g., synthetic Canny control), avoid running Canny again.
+    cond_vals = np.unique(cond)
+    if cond_vals.size <= 4 and np.all(np.isin(cond_vals, [0, 255])):
+        e_cond = (cond > 127).astype(np.uint8) * 255
+    else:
+        e_cond = cv2.Canny(cv2.GaussianBlur(cond, (3, 3), 0.5), 50, 150)
+    inter = np.logical_and(e_gen > 0, e_cond > 0).sum()
+    union = np.logical_or(e_gen > 0, e_cond > 0).sum()
+    if union == 0:
+        return 1.0
+    return float(inter) / float(union)
+
+
+def run_sas_struct(pipe_cn, clip_model, clip_preprocess, clip_tokenizer, prompts, control_images, seed=SEED):
+    """SAS for structure: at sampled steps, decode pred_x0 and compute structural alignment (edge overlap) + CLIP."""
+    pipe_cn.scheduler.set_timesteps(NUM_INFERENCE_STEPS, device=DEVICE)
+    timesteps = pipe_cn.scheduler.timesteps
+    n_prompts = min(len(prompts), len(control_images))
+    sas_struct_all = []
+    sas_text_all = []
+
+    for pi in range(n_prompts):
+        prompt = prompts[pi]
+        ctrl_img = control_images[pi]
+        print(f"  [SAS_struct] Prompt {pi+1}/{n_prompts}: {prompt[:40]}...")
+        text_emb, uncond_emb = encode_prompt(pipe_cn, prompt)
+        ctrl_tensor = prepare_control_image(pipe_cn, ctrl_img)
+
+        generator = torch.Generator(device=DEVICE).manual_seed(seed)
+        latents = torch.randn(
+            (1, pipe_cn.unet.config.in_channels, IMG_HEIGHT // 8, IMG_WIDTH // 8),
+            generator=generator, device=DEVICE, dtype=DTYPE,
+        )
+        latents = latents * pipe_cn.scheduler.init_noise_sigma
+
+        struct_vals = []
+        text_vals = []
+        step_indices = []
+        for i, t in enumerate(timesteps):
+            t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else -1
+            latents, pred_x0 = _controlnet_cfg_step(
+                pipe_cn, latents, t, t_prev, text_emb, uncond_emb, ctrl_tensor, CONTROLNET_STRUCT_SCALE,
+            )
+            if i % 5 == 0 or i == len(timesteps) - 1:
+                try:
+                    pil_img = predicted_x0_to_image(pipe_cn, pred_x0)
+                    s_struct = _structural_similarity_canny(pil_img, ctrl_img)
+                    s_text = compute_clip_similarity(clip_model, clip_preprocess, clip_tokenizer, pil_img, prompt)
+                except Exception:
+                    s_struct = 0.0
+                    s_text = 0.0
+                struct_vals.append(s_struct)
+                text_vals.append(s_text)
+                step_indices.append(i)
+        sas_struct_all.append((step_indices, struct_vals))
+        sas_text_all.append((step_indices, text_vals))
+
+    return {
+        "timesteps": [t.item() for t in timesteps],
+        "sas_struct_per_prompt": sas_struct_all,
+        "sas_text_per_prompt": sas_text_all,
+        "prompts": prompts[:n_prompts],
+    }
+
+
+def run_selective_structural(pipe_cn, clip_model, clip_preprocess, clip_tokenizer, prompts, control_images, seed=SEED):
+    """Selective structural conditioning: apply structure only in early / mid / late windows."""
+    pipe_cn.scheduler.set_timesteps(NUM_INFERENCE_STEPS, device=DEVICE)
+    timesteps = pipe_cn.scheduler.timesteps
+    n_steps = len(timesteps)
+    early_end = int(n_steps * 0.4)
+    mid_start = early_end
+    mid_end = int(n_steps * 0.7)
+    late_start = mid_end
+    windows = {
+        "full": (0, n_steps),
+        "early_only": (0, early_end),
+        "mid_only": (mid_start, mid_end),
+        "late_only": (late_start, n_steps),
+        "none": (-1, -1),
+    }
+
+    n_prompts = min(len(prompts), len(control_images), 4)
+    results = {}
+    for pi in range(n_prompts):
+        prompt = prompts[pi]
+        ctrl_img = control_images[pi]
+        print(f"  [Selective struct] Prompt {pi+1}/{n_prompts}: {prompt[:40]}...")
+        text_emb, uncond_emb = encode_prompt(pipe_cn, prompt)
+        ctrl_tensor = prepare_control_image(pipe_cn, ctrl_img)
+        prompt_results = {}
+
+        for wname, (ws, we) in windows.items():
+            generator = torch.Generator(device=DEVICE).manual_seed(seed)
+            latents = torch.randn(
+                (1, pipe_cn.unet.config.in_channels, IMG_HEIGHT // 8, IMG_WIDTH // 8),
+                generator=generator, device=DEVICE, dtype=DTYPE,
+            )
+            latents = latents * pipe_cn.scheduler.init_noise_sigma
+
+            for i, t in enumerate(timesteps):
+                scale = 1.0 if (ws <= i < we) else 0.0
+                t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else -1
+                latents, pred_x0 = _controlnet_cfg_step(
+                    pipe_cn, latents, t, t_prev, text_emb, uncond_emb, ctrl_tensor, scale,
+                )
+
+            final_img = predicted_x0_to_image(pipe_cn, pred_x0)
+            clip_score = compute_clip_similarity(clip_model, clip_preprocess, clip_tokenizer, final_img, prompt)
+            struct_score = _structural_similarity_canny(final_img, ctrl_img)
+            prompt_results[wname] = {"image": final_img, "clip_score": clip_score, "struct_score": struct_score}
+            print(f"    {wname}: CLIP={clip_score:.4f} struct={struct_score:.4f}")
+
+        results[prompt] = prompt_results
+    return results
+
+
 # ---- Visualization ----
 
 def plot_cis_curve(data, save_path):
@@ -506,8 +942,139 @@ def plot_cis_multi_guidance(data, save_path):
     print(f"  Saved: {save_path}")
 
 
+# ---- ControlNet visualization ----
+
+def plot_cis_struct_curve(data, save_path):
+    timesteps = data["timesteps"]
+    cis_arr = np.array(data["cis_struct_per_prompt"])
+    mean_cis = cis_arr.mean(axis=0)
+    std_cis = cis_arr.std(axis=0)
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(range(len(timesteps)), mean_cis, color="#9333ea", linewidth=2, label="Mean CIS (struct)")
+    ax.fill_between(range(len(timesteps)), mean_cis - std_cis, mean_cis + std_cis,
+                    alpha=0.2, color="#9333ea")
+    ax.set_xlabel("Denoising Step Index (0 = noisiest)", fontsize=12)
+    ax.set_ylabel("Structural CIS (L2)", fontsize=12)
+    ax.set_title("Structural Conditioning Influence Score Across Steps", fontsize=13)
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {save_path}")
+
+
+def plot_sas_struct_curves(data, save_path):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    # Structural alignment
+    ax = axes[0]
+    for pi, (indices, vals) in enumerate(data["sas_struct_per_prompt"]):
+        ax.plot(indices, vals, marker="o", markersize=3, alpha=0.5,
+                label=data["prompts"][pi][:25] + "...")
+    all_inds = data["sas_struct_per_prompt"][0][0]
+    mean_s = np.array([v for _, v in data["sas_struct_per_prompt"]]).mean(axis=0)
+    ax.plot(all_inds, mean_s, color="black", linewidth=2.5, marker="s", markersize=5, label="Mean")
+    ax.set_xlabel("Denoising Step Index", fontsize=12)
+    ax.set_ylabel("Edge overlap (struct)", fontsize=12)
+    ax.set_title("SAS Structural Alignment", fontsize=13)
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+    # Text alignment
+    ax = axes[1]
+    for pi, (indices, vals) in enumerate(data["sas_text_per_prompt"]):
+        ax.plot(indices, vals, marker="o", markersize=3, alpha=0.5,
+                label=data["prompts"][pi][:25] + "...")
+    mean_t = np.array([v for _, v in data["sas_text_per_prompt"]]).mean(axis=0)
+    ax.plot(all_inds, mean_t, color="black", linewidth=2.5, marker="s", markersize=5, label="Mean")
+    ax.set_xlabel("Denoising Step Index", fontsize=12)
+    ax.set_ylabel("CLIP similarity (text)", fontsize=12)
+    ax.set_title("SAS Text Alignment", fontsize=13)
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {save_path}")
+
+
+def plot_ts_struct(data, save_path):
+    timesteps = data["timesteps"]
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    colors = ["#e63946", "#457b9d", "#2a9d8f", "#e9c46a"]
+    for i, ts_vals in enumerate(data["ts_struct_per_pair"]):
+        ax.plot(range(len(timesteps)), ts_vals, linewidth=1.8, color=colors[i % len(colors)],
+                label=f"Pair {i+1}")
+    arr = np.array(data["ts_struct_per_pair"])
+    mean_ts = arr.mean(axis=0)
+    ax.plot(range(len(timesteps)), mean_ts, color="black", linewidth=2.5, linestyle="--", label="Mean")
+    ax.set_xlabel("Denoising Step Index", fontsize=12)
+    ax.set_ylabel("Trajectory Divergence (L2)", fontsize=12)
+    ax.set_title("Trajectory Sensitivity (Structural Conditioning)", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {save_path}")
+
+
+def plot_selective_structural_grid(results, save_path):
+    prompts_list = list(results.keys())
+    windows = ["full", "early_only", "mid_only", "late_only", "none"]
+    wlabels = ["Full", "Early Only", "Mid Only", "Late Only", "None"]
+    fig, axes = plt.subplots(len(prompts_list), len(windows),
+                             figsize=(3.2 * len(windows), 3.5 * len(prompts_list)))
+    for row, prompt in enumerate(prompts_list):
+        for col, (wname, wlabel) in enumerate(zip(windows, wlabels)):
+            ax = axes[row, col] if len(prompts_list) > 1 else axes[col]
+            img = results[prompt][wname]["image"]
+            clip_s = results[prompt][wname]["clip_score"]
+            struct_s = results[prompt][wname]["struct_score"]
+            ax.imshow(img)
+            ax.axis("off")
+            title = f"{wlabel}\nCLIP:{clip_s:.3f} Struct:{struct_s:.3f}"
+            ax.set_title(title, fontsize=8)
+        if len(prompts_list) > 1:
+            axes[row, 0].set_ylabel(prompt[:20] + "...", fontsize=8)
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {save_path}")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Noise-level dependence experiments (text + ControlNet).")
+    parser.add_argument("--controlnet-only", action="store_true",
+                        help="Run only ControlNet structural conditioning experiments.")
+    parser.add_argument("--seed", type=int, default=SEED,
+                        help=f"Random seed for reproducibility (default: {SEED}).")
+    args = parser.parse_args()
+    seed = args.seed
+
+    # Fix seeds for full reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     print("=" * 60)
+    print(f"Random seed: {seed}")
+    print("=" * 60)
+
+    if args.controlnet_only:
+        if not HAS_CONTROLNET or not HAS_CV2:
+            print("ControlNet experiments require: diffusers (with ControlNet) and opencv-python.")
+            sys.exit(1)
+        print("Loading CLIP model...")
+        clip_model, clip_preprocess, clip_tokenizer = load_clip_model()
+        _run_controlnet_experiments(seed, clip_model, clip_preprocess, clip_tokenizer)
+        print("\n" + "=" * 60)
+        print("ControlNet experiments complete.")
+        print(f"Results: {OUTPUT_DIR}")
+        print(f"Figures: {FIGURE_DIR}")
+        print("=" * 60)
+        return
+
     print("Loading Stable Diffusion 1.5 pipeline...")
     pipe = load_sd_pipeline()
 
@@ -517,7 +1084,7 @@ def main():
     print("\n" + "=" * 60)
     print("Experiment 1 & 4: CIS and Semantic Alignment Score")
     print("=" * 60)
-    cis_sas_data = run_cis_and_sas(pipe, clip_model, clip_preprocess, clip_tokenizer, PROMPTS)
+    cis_sas_data = run_cis_and_sas(pipe, clip_model, clip_preprocess, clip_tokenizer, PROMPTS, seed=seed)
 
     sas_serializable = []
     for indices, vals in cis_sas_data["sas_per_prompt"]:
@@ -538,7 +1105,7 @@ def main():
     print("Experiment 2: Selective Conditioning Intervention")
     print("=" * 60)
     selective_data = run_selective_conditioning(
-        pipe, clip_model, clip_preprocess, clip_tokenizer, PROMPTS
+        pipe, clip_model, clip_preprocess, clip_tokenizer, PROMPTS, seed=seed
     )
 
     clip_scores_save = {}
@@ -553,7 +1120,7 @@ def main():
     print("\n" + "=" * 60)
     print("Experiment 3: Trajectory Sensitivity")
     print("=" * 60)
-    ts_data = run_trajectory_sensitivity(pipe, PROMPT_PAIRS)
+    ts_data = run_trajectory_sensitivity(pipe, PROMPT_PAIRS, seed=seed)
 
     with open(os.path.join(OUTPUT_DIR, "trajectory_sensitivity.json"), "w") as f:
         json.dump(ts_data, f, indent=2)
@@ -563,17 +1130,83 @@ def main():
     print("\n" + "=" * 60)
     print("Experiment 5: CIS with Multiple Guidance Scales")
     print("=" * 60)
-    gs_data = run_cis_multi_guidance(pipe, PROMPTS)
+    gs_data = run_cis_multi_guidance(pipe, PROMPTS, seed=seed)
 
     with open(os.path.join(OUTPUT_DIR, "cis_multi_guidance.json"), "w") as f:
         json.dump(gs_data, f, indent=2)
     plot_cis_multi_guidance(gs_data, os.path.join(FIGURE_DIR, "cis_multi_guidance.pdf"))
+
+    # -------- ControlNet structural conditioning experiments --------
+    if HAS_CONTROLNET and HAS_CV2:
+        _run_controlnet_experiments(seed, clip_model, clip_preprocess, clip_tokenizer)
+    else:
+        print("\n[Skip] ControlNet experiments (missing diffusers ControlNet or opencv).")
 
     print("\n" + "=" * 60)
     print("ALL EXPERIMENTS COMPLETE!")
     print(f"Results saved to: {OUTPUT_DIR}")
     print(f"Figures saved to: {FIGURE_DIR}")
     print("=" * 60)
+
+
+def _run_controlnet_experiments(seed, clip_model, clip_preprocess, clip_tokenizer):
+    """Run ControlNet structural conditioning: CIS_struct, TS_struct, SAS_struct, selective structural."""
+    print("\n" + "=" * 60)
+    print("ControlNet: Loading pipeline and creating control images...")
+    print("=" * 60)
+    pipe_cn = load_controlnet_pipeline()
+    n_ctrl = 6
+    # Keep prompts identical to text-only experiments (control variable),
+    # and build prompt-matched Canny control images.
+    prompts_cn = PROMPTS[:n_ctrl]
+    control_images = create_prompt_matched_control_images(pipe_cn, prompts_cn, seed=seed)
+    # Pairs of control images for TS (same prompt, different structure)
+    control_pairs = [(control_images[i], control_images[(i + 1) % n_ctrl]) for i in range(4)]
+    prompt_ts = prompts_cn[0]
+
+    print("\n  ControlNet Experiment 1: CIS (structural conditioning influence)")
+    cis_struct_data = run_cis_struct(
+        pipe_cn, clip_model, clip_preprocess, clip_tokenizer,
+        prompts_cn, control_images, seed=seed,
+    )
+    with open(os.path.join(OUTPUT_DIR, "cis_struct_data.json"), "w") as f:
+        json.dump({
+            "timesteps": cis_struct_data["timesteps"],
+            "cis_struct_per_prompt": cis_struct_data["cis_struct_per_prompt"],
+            "prompts": cis_struct_data["prompts"],
+        }, f, indent=2)
+    plot_cis_struct_curve(cis_struct_data, os.path.join(FIGURE_DIR, "cis_struct_curve.pdf"))
+
+    print("\n  ControlNet Experiment 2: Trajectory Sensitivity (structural)")
+    ts_struct_data = run_ts_struct(pipe_cn, prompt_ts, control_pairs, seed=seed)
+    with open(os.path.join(OUTPUT_DIR, "ts_struct_data.json"), "w") as f:
+        json.dump(ts_struct_data, f, indent=2)
+    plot_ts_struct(ts_struct_data, os.path.join(FIGURE_DIR, "ts_struct.pdf"))
+
+    print("\n  ControlNet Experiment 3: SAS (structural + text alignment)")
+    sas_struct_data = run_sas_struct(
+        pipe_cn, clip_model, clip_preprocess, clip_tokenizer,
+        prompts_cn, control_images, seed=seed,
+    )
+    sas_ser = []
+    for (inds, s), (_, t) in zip(sas_struct_data["sas_struct_per_prompt"], sas_struct_data["sas_text_per_prompt"]):
+        sas_ser.append({"indices": inds, "struct": s, "text": t})
+    with open(os.path.join(OUTPUT_DIR, "sas_struct_data.json"), "w") as f:
+        json.dump({"timesteps": sas_struct_data["timesteps"], "sas_per_prompt": sas_ser, "prompts": sas_struct_data["prompts"]}, f, indent=2)
+    plot_sas_struct_curves(sas_struct_data, os.path.join(FIGURE_DIR, "sas_struct_curves.pdf"))
+
+    print("\n  ControlNet Experiment 4: Selective structural conditioning")
+    selective_struct_data = run_selective_structural(
+        pipe_cn, clip_model, clip_preprocess, clip_tokenizer,
+        prompts_cn[:4], control_images[:4], seed=seed,
+    )
+    clip_struct_scores = {}
+    for prompt, wdata in selective_struct_data.items():
+        clip_struct_scores[prompt] = {w: {"clip_score": d["clip_score"], "struct_score": d["struct_score"]} for w, d in wdata.items()}
+    with open(os.path.join(OUTPUT_DIR, "selective_structural_scores.json"), "w") as f:
+        json.dump(clip_struct_scores, f, indent=2)
+    plot_selective_structural_grid(selective_struct_data, os.path.join(FIGURE_DIR, "selective_structural_grid.pdf"))
+    print("  ControlNet experiments done.")
 
 
 if __name__ == "__main__":
